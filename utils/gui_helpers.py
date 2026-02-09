@@ -177,6 +177,39 @@ else:
 
 
 # ---------------------------------------------------------------------------
+# App name → executable mapping for common Windows apps
+# ---------------------------------------------------------------------------
+
+APP_EXECUTABLES: dict[str, tuple[str, str]] = {
+    # name → (executable_path, window_title_keyword)
+    "chrome": (r"C:\Program Files\Google\Chrome\Application\chrome.exe", "chrome"),
+    "google chrome": (r"C:\Program Files\Google\Chrome\Application\chrome.exe", "chrome"),
+    "firefox": (r"C:\Program Files\Mozilla Firefox\firefox.exe", "firefox"),
+    "edge": ("msedge", "edge"),
+    "notepad": ("notepad", "notepad"),
+    "calculator": ("calc", "calculator"),
+    "calc": ("calc", "calculator"),
+    "paint": ("mspaint", "paint"),
+    "mspaint": ("mspaint", "paint"),
+    "explorer": ("explorer", "explorer"),
+    "cmd": ("cmd", "command prompt"),
+    "powershell": ("powershell", "powershell"),
+    "wordpad": ("wordpad", "wordpad"),
+}
+
+
+def _resolve_executable(name: str) -> tuple[str, str]:
+    """Resolve a friendly app name to (executable_path, window_title_keyword).
+
+    Returns the original name as both if no mapping exists.
+    """
+    key = name.lower().replace(".exe", "").strip()
+    if key in APP_EXECUTABLES:
+        return APP_EXECUTABLES[key]
+    return (name, key)
+
+
+# ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
 
@@ -185,7 +218,11 @@ def start_application(
     executable: str,
     backend: str = "uia",
 ) -> tuple[Any | None, str]:
-    """Start an application by executable path.
+    """Start an application and connect to its new window.
+
+    Windows 11 modern apps (like Notepad) use a launcher process,
+    so app.start() may capture the wrong PID. We start the process
+    externally, detect the new window, and connect to it.
 
     Args:
         executable: Path or name of the executable to start.
@@ -194,10 +231,80 @@ def start_application(
     Returns:
         Tuple of (Application instance or None, status message).
     """
+    import subprocess
+    import time
+
+    exe_path, title_keyword = _resolve_executable(executable)
+    app_base = title_keyword
+
     try:
-        app = Application(backend=backend)
-        app.start(executable, timeout=10)
-        return app, f"Started '{executable}' successfully"
+        # Record existing windows matching this app BEFORE starting
+        desktop_before = Desktop(backend=backend)
+        existing_pids = set()
+        for w in desktop_before.windows():
+            try:
+                if app_base in w.window_text().lower():
+                    pid = getattr(w, "process_id", None)
+                    if callable(pid):
+                        pid = pid()
+                    if pid:
+                        existing_pids.add(pid)
+            except Exception:
+                continue
+
+        # Start the process
+        subprocess.Popen(exe_path)
+        time.sleep(3)
+
+        # Find the NEW window (PID not in existing set)
+        desktop_after = Desktop(backend=backend)
+        new_window = None
+        for w in desktop_after.windows():
+            try:
+                if app_base in w.window_text().lower():
+                    pid = getattr(w, "process_id", None)
+                    if callable(pid):
+                        pid = pid()
+                    if pid and pid not in existing_pids:
+                        new_window = w
+                        app = Application(backend=backend)
+                        app.connect(process=pid, timeout=15)
+                        return app, f"Started '{executable}' successfully"
+            except Exception:
+                continue
+
+        # Fallback: look for a window that looks like a fresh/new instance
+        # (e.g. "Untitled - Notepad" vs an already-open document)
+        for w in desktop_after.windows():
+            try:
+                title = w.window_text()
+                if app_base in title.lower() and "untitled" in title.lower():
+                    pid = getattr(w, "process_id", None)
+                    if callable(pid):
+                        pid = pid()
+                    if pid:
+                        app = Application(backend=backend)
+                        app.connect(process=pid, timeout=15)
+                        return app, f"Started '{executable}' successfully"
+            except Exception:
+                continue
+
+        # Last resort: connect to the first matching window
+        for w in desktop_after.windows():
+            try:
+                title = w.window_text()
+                if app_base in title.lower():
+                    pid = getattr(w, "process_id", None)
+                    if callable(pid):
+                        pid = pid()
+                    if pid:
+                        app = Application(backend=backend)
+                        app.connect(process=pid, timeout=15)
+                        return app, f"Started '{executable}' successfully"
+            except Exception:
+                continue
+
+        return None, f"Started '{executable}' but could not find its window"
     except Exception as e:
         return None, f"Failed to start '{executable}': {e}"
 
@@ -317,9 +424,12 @@ def list_all_windows(backend: str = "uia") -> list[dict[str, Any]]:
         result = []
         for w in windows:
             try:
+                pid = getattr(w, "process_id", None)
+                if callable(pid):
+                    pid = pid()
                 result.append({
                     "title": w.window_text(),
-                    "process_id": getattr(w, "process_id", None),
+                    "process_id": pid,
                     "rectangle": str(w.rectangle()),
                     "class_name": w.friendly_class_name(),
                 })
@@ -342,6 +452,8 @@ def safe_click(control: Any, timeout: int = 10) -> str:
     """
     try:
         control.wait("enabled", timeout=timeout)
+        if hasattr(control, "set_focus"):
+            control.set_focus()
         control.click_input()
         return f"Clicked '{control.window_text()}'"
     except Exception as e:
@@ -359,9 +471,15 @@ def safe_type(control: Any, text: str, timeout: int = 10) -> str:
     Returns:
         Status message.
     """
+    import time as _time
+
     try:
         control.wait("enabled", timeout=timeout)
-        control.type_keys(text, with_spaces=True)
+        if hasattr(control, "set_focus"):
+            control.set_focus()
+        # Small pause before typing to let focus settle
+        _time.sleep(0.3)
+        control.type_keys(text, with_spaces=True, pause=0.05)
         return f"Typed text into '{control.window_text()}'"
     except Exception as e:
         return f"Type failed: {e}"

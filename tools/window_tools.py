@@ -5,6 +5,7 @@ Tools for listing, finding, and connecting to Windows applications.
 All functions return strings so the LLM can interpret the results.
 """
 
+import time
 from typing import Any
 
 from langchain_core.tools import tool
@@ -80,26 +81,66 @@ def connect_to_app(app_name: str, start_if_not_found: bool = True) -> str:
 
     Stores the connected app in the internal registry for use by other tools.
     """
-    # Check if already connected
-    if app_name.lower() in _app_registry:
-        return f"Already connected to '{app_name}'."
+    key = app_name.lower()
+    title_re = f"(?i).*{app_name}.*"
+
+    # Check if already connected with a valid window
+    if key in _app_registry:
+        entry = _app_registry[key]
+        if entry.get("window") is not None:
+            return f"Already connected to '{app_name}'."
+        # Window was None from a previous failed attempt, remove and retry
+        del _app_registry[key]
 
     # Try to connect to running instance
-    app, msg = connect_to_application(title_re=f".*{app_name}.*")
+    app, msg = connect_to_application(title_re=title_re)
     if app is not None:
-        window, win_msg = get_window(app, title_re=f".*{app_name}.*")
-        _app_registry[app_name.lower()] = {"app": app, "window": window}
-        return f"Connected to '{app_name}'. {win_msg}"
+        try:
+            window = app.top_window()
+            _app_registry[key] = {"app": app, "window": window}
+            return f"Connected to '{app_name}'. Window: '{window.window_text()}'"
+        except Exception:
+            pass
 
     # Start the application if allowed
     if start_if_not_found:
         app, msg = start_application(app_name)
         if app is not None:
-            window, win_msg = get_window(app, title_re=f".*{app_name}.*")
-            _app_registry[app_name.lower()] = {"app": app, "window": window}
-            return f"Started and connected to '{app_name}'. {win_msg}"
+            try:
+                window = app.top_window()
+                _app_registry[key] = {"app": app, "window": window}
+                return f"Started and connected to '{app_name}'. Window: '{window.window_text()}'"
+            except Exception as e:
+                return f"Started '{app_name}' but could not get window: {e}"
 
     return f"Could not connect to '{app_name}': {msg}"
+
+
+@tool
+def start_app(app_name: str) -> str:
+    """Start a new instance of an application (always launches fresh).
+
+    Args:
+        app_name: Name of the application executable (e.g. 'notepad', 'calc').
+
+    Use this instead of connect_to_app when the user explicitly says 'open'
+    and you want a fresh window rather than reusing an existing one.
+    """
+    key = app_name.lower()
+
+    # Remove any old registry entry so we get a fresh connection
+    _app_registry.pop(key, None)
+
+    app, msg = start_application(app_name)
+    if app is None:
+        return f"Could not start '{app_name}': {msg}"
+
+    try:
+        window = app.top_window()
+        _app_registry[key] = {"app": app, "window": window}
+        return f"Started '{app_name}'. Window: '{window.window_text()}'"
+    except Exception as e:
+        return f"Started '{app_name}' but could not get window: {e}"
 
 
 @tool

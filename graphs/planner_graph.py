@@ -65,7 +65,8 @@ PLANNER_SYSTEM_PROMPT = """You are an automation planner. Given a user's natural
 create a structured plan to automate it on a Windows desktop application.
 
 Available tools you can plan for:
-- connect_to_app(app_name, start_if_not_found): Connect to or start an application
+- start_app(app_name): Start a NEW instance of an application (always launches fresh)
+- connect_to_app(app_name, start_if_not_found): Connect to a RUNNING application (or start if not found)
 - list_windows(): List all visible desktop windows
 - find_window(title): Find a window by partial title match
 - get_window_info(app_name): Get window details
@@ -74,7 +75,7 @@ Available tools you can plan for:
 - list_child_controls(app_name, control_type): List actionable controls
 - take_screenshot(app_name, filename): Screenshot the app window
 - click_element(app_name, control_type, title, auto_id): Click a UI element
-- type_text(app_name, text, control_type, title, auto_id, use_set_text): Type text
+- type_text(app_name, text, control_type, title, auto_id, use_set_text): Type text into a control or window
 - press_keys(app_name, keys): Press keyboard keys (pywinauto syntax)
 - select_item(app_name, item_text, control_type, title, auto_id): Select list/combo item
 - menu_select(app_name, menu_path): Select a menu item (e.g. 'File->Save')
@@ -83,11 +84,12 @@ Key syntax for press_keys:
 - '^s' = Ctrl+S, '%{F4}' = Alt+F4, '{ENTER}' = Enter, '{TAB}' = Tab
 
 Rules:
-1. Always start with connect_to_app to ensure the application is running
-2. Use inspect_control_tree if you need to discover available controls
-3. Prefer automation_id over title for control identification when possible
-4. Include verification steps after critical actions
-5. Keep the plan minimal — only the steps needed to accomplish the task
+1. When the user says "open" an app, use start_app to launch a FRESH instance
+2. When the user says "in <app>" or wants to work with an already-running app, use connect_to_app
+3. Use inspect_control_tree if you need to discover available controls
+4. Prefer automation_id over title for control identification when possible
+5. Include verification steps after critical actions
+6. Keep the plan minimal — only the steps needed to accomplish the task
 """
 
 
@@ -99,7 +101,7 @@ Rules:
 def parse_command(state: PlannerState) -> dict:
     """Parse the user command into a structured action plan."""
     llm = get_llm()
-    structured_llm = llm.with_structured_output(ActionPlan)
+    structured_llm = llm.with_structured_output(ActionPlan, method="function_calling")
 
     messages = [
         SystemMessage(content=PLANNER_SYSTEM_PROMPT),

@@ -7,18 +7,18 @@ that routes between specialized sub-agents.
 """
 
 import operator
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
-from pydantic import BaseModel, Field
 
-from config.config import get_llm
+from config.config import get_llm  # used by action_executor, verifier
 from graphs.planner_graph import build_planner_graph
-from tools import all_tools, inspect_tools, input_tools, window_tools
+from tools import all_tools, inspect_tools
+
 
 MAX_ITERATIONS = 20
 
@@ -40,53 +40,6 @@ class AutomationState(TypedDict):
     next_node: str
 
 
-# ---------------------------------------------------------------------------
-# Supervisor routing model
-# ---------------------------------------------------------------------------
-
-
-class SupervisorDecision(BaseModel):
-    """Supervisor's routing decision."""
-
-    next_node: Literal[
-        "INTENT_PARSER",
-        "WINDOW_FINDER",
-        "ACTION_EXECUTOR",
-        "VERIFIER",
-        "COMPLETE",
-        "FAILED",
-    ] = Field(description="The next agent to route to based on current progress")
-    reasoning: str = Field(description="Brief explanation for the routing decision")
-
-
-SUPERVISOR_PROMPT = """You are the supervisor of a Windows GUI automation system.
-Your job is to route work to the right specialized agent based on current progress.
-
-Current state:
-- User command: {user_command}
-- Target app: {target_app}
-- Status: {status}
-- Current step: {current_step} / {total_steps}
-- Iteration: {iteration_count} / {max_iterations}
-- Recent results: {recent_results}
-
-Available agents:
-- INTENT_PARSER: Analyzes the user command and creates a step-by-step plan. Use when no plan exists yet.
-- WINDOW_FINDER: Finds and connects to the target application window. Use after planning, before execution.
-- ACTION_EXECUTOR: Executes the next planned action step. Use when connected to the app and steps remain.
-- VERIFIER: Checks that the last action succeeded. Use after executing a critical step.
-- COMPLETE: All steps done successfully. Use when all planned actions are executed and verified.
-- FAILED: Something went wrong that cannot be recovered. Use only after multiple retries fail.
-
-Rules:
-1. Always start with INTENT_PARSER if no plan exists
-2. After planning, use WINDOW_FINDER to connect to the target app
-3. After connecting, use ACTION_EXECUTOR for each planned step
-4. Use VERIFIER after important actions (typing text, saving files, etc.)
-5. Route to COMPLETE when all steps are done
-6. Route to FAILED only if unrecoverable errors occur after retries
-"""
-
 
 # ---------------------------------------------------------------------------
 # Nodes
@@ -94,7 +47,15 @@ Rules:
 
 
 def supervisor(state: AutomationState) -> dict:
-    """Route to the next agent based on current automation progress."""
+    """Deterministic routing based on state — no LLM call needed.
+
+    Decision tree:
+    1. No plan yet (planned_actions empty)       → intent_parser
+    2. Steps remaining (current_step < total)    → action_executor
+    3. All steps done, verifier hasn't run yet   → verifier
+    4. Verifier already ran (status="verifying")  → complete
+    5. Max iterations exceeded                    → failed
+    """
     iteration = state.get("iteration_count", 0) + 1
 
     if iteration > MAX_ITERATIONS:
@@ -105,28 +66,23 @@ def supervisor(state: AutomationState) -> dict:
             "messages": [AIMessage(content="Max iterations reached. Stopping.")],
         }
 
-    llm = get_llm()
-    structured_llm = llm.with_structured_output(SupervisorDecision)
-
     planned = state.get("planned_actions", [])
-    results = state.get("execution_results", [])
+    current_step = state.get("current_step", 0)
+    status = state.get("status", "starting")
 
-    prompt = SUPERVISOR_PROMPT.format(
-        user_command=state.get("user_command", ""),
-        target_app=state.get("target_app", "unknown"),
-        status=state.get("status", "starting"),
-        current_step=state.get("current_step", 0),
-        total_steps=len(planned),
-        iteration_count=iteration,
-        max_iterations=MAX_ITERATIONS,
-        recent_results="; ".join(results[-3:]) if results else "none yet",
-    )
-
-    messages = [SystemMessage(content=prompt)] + state["messages"][-10:]
-    decision: SupervisorDecision = structured_llm.invoke(messages)
+    if not planned:
+        next_node = "intent_parser"
+    elif current_step < len(planned):
+        next_node = "action_executor"
+    elif status in ("verifying", "verified", "verification_failed"):
+        # Verifier already ran — done
+        next_node = "complete"
+    else:
+        # All steps executed, verifier hasn't run yet
+        next_node = "verifier"
 
     return {
-        "next_node": decision.next_node.lower(),
+        "next_node": next_node,
         "iteration_count": iteration,
     }
 
@@ -164,24 +120,6 @@ def intent_parser(state: AutomationState) -> dict:
     }
 
 
-def window_finder(state: AutomationState) -> dict:
-    """Use window tools to find and connect to the target application."""
-    llm = get_llm()
-    llm_with_tools = llm.bind_tools(window_tools)
-
-    prompt = (
-        f"Connect to the application '{state['target_app']}'. "
-        f"First list windows to see what's running, then connect to the app "
-        f"(start it if not found). Return the connection status."
-    )
-    messages = [SystemMessage(content=prompt)] + state["messages"][-5:]
-    response = llm_with_tools.invoke(messages)
-
-    return {
-        "messages": [response],
-        "status": "finding_window",
-    }
-
 
 def action_executor(state: AutomationState) -> dict:
     """Execute the next planned action step."""
@@ -199,13 +137,15 @@ def action_executor(state: AutomationState) -> dict:
 
     step = planned[current]
     prompt = (
-        f"Execute step {step['step_number']}: {step['action']}\n"
-        f"Tool to use: {step['tool_name']}\n"
+        f"Execute ONLY this one step — do not call any other tools.\n"
+        f"Step {step['step_number']}: {step['action']}\n"
+        f"Tool: {step['tool_name']}\n"
         f"Arguments: {step['tool_args']}\n"
         f"Target app: {state['target_app']}\n\n"
-        f"Call the appropriate tool to execute this step."
+        f"Call EXACTLY the tool '{step['tool_name']}' with the given arguments. "
+        f"Do NOT call any other tools. Make exactly ONE tool call."
     )
-    messages = [SystemMessage(content=prompt)] + state["messages"][-5:]
+    messages = [SystemMessage(content=prompt)] + list(state["messages"])
     response = llm_with_tools.invoke(messages)
 
     return {
@@ -240,7 +180,7 @@ def verifier(state: AutomationState) -> dict:
         f"Use inspection tools to check the current state of the application. "
         f"Report whether the action succeeded or failed."
     )
-    messages = [SystemMessage(content=prompt)] + state["messages"][-5:]
+    messages = [SystemMessage(content=prompt)] + list(state["messages"])
     response = llm_with_tools.invoke(messages)
 
     return {
@@ -281,10 +221,6 @@ def _handle_tool_result(state: AutomationState) -> dict:
     return {}
 
 
-def window_finder_post(state: AutomationState) -> dict:
-    return _handle_tool_result(state)
-
-
 def executor_post(state: AutomationState) -> dict:
     return _handle_tool_result(state)
 
@@ -319,8 +255,6 @@ def build_automation_graph():
     # --- Nodes ---
     builder.add_node("supervisor", supervisor)
     builder.add_node("intent_parser", intent_parser)
-    builder.add_node("window_finder", window_finder)
-    builder.add_node("window_finder_tools", ToolNode(window_tools))
     builder.add_node("action_executor", action_executor)
     builder.add_node("action_executor_tools", ToolNode(all_tools))
     builder.add_node("verifier", verifier)
@@ -337,7 +271,6 @@ def build_automation_graph():
         supervisor_router,
         {
             "intent_parser": "intent_parser",
-            "window_finder": "window_finder",
             "action_executor": "action_executor",
             "verifier": "verifier",
             "complete": "complete",
@@ -347,17 +280,6 @@ def build_automation_graph():
 
     # --- Intent parser → supervisor ---
     builder.add_edge("intent_parser", "supervisor")
-
-    # --- Window finder agent loop ---
-    builder.add_conditional_edges(
-        "window_finder",
-        _route_or_return("window_finder"),
-        {
-            "window_finder_tools": "window_finder_tools",
-            "supervisor": "supervisor",
-        },
-    )
-    builder.add_edge("window_finder_tools", "window_finder")
 
     # --- Action executor agent loop ---
     builder.add_conditional_edges(
