@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__pywinauto-mcp__automation_windows",
+      "mcp__pywinauto-mcp__automation_system",
+      "mcp__pywinauto-mcp__automation_elements",
+      "mcp__pywinauto-mcp__automation_mouse",
+      "mcp__pywinauto-mcp__automation_keyboard",
+      "mcp__pywinauto-mcp__automation_visual",
+      "mcp__pywinauto-mcp__automation_face",
+      "mcp__pywinauto-mcp__get_desktop_state",
+      "Bash(start *)",
+      "Bash(mkdir *)",
+      "Bash(taskkill *)",
+      "Bash(poetry run python:*)",
+      "Bash(taskkill:*)",
+      "mcp__plugin_context7_context7__resolve-library-id",
+      "mcp__plugin_context7_context7__query-docs"
+    ]
+  }
+}

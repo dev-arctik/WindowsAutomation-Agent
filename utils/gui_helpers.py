@@ -185,16 +185,22 @@ APP_EXECUTABLES: dict[str, tuple[str, str]] = {
     "chrome": (r"C:\Program Files\Google\Chrome\Application\chrome.exe", "chrome"),
     "google chrome": (r"C:\Program Files\Google\Chrome\Application\chrome.exe", "chrome"),
     "firefox": (r"C:\Program Files\Mozilla Firefox\firefox.exe", "firefox"),
-    "edge": ("msedge", "edge"),
+    "brave": (r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe", "brave"),
+    "edge": (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", "edge"),
+    "microsoft edge": (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", "edge"),
     "notepad": ("notepad", "notepad"),
     "calculator": ("calc", "calculator"),
     "calc": ("calc", "calculator"),
-    "paint": ("mspaint", "paint"),
-    "mspaint": ("mspaint", "paint"),
     "explorer": ("explorer", "explorer"),
+    "file explorer": ("explorer", "explorer"),
     "cmd": ("cmd", "command prompt"),
     "powershell": ("powershell", "powershell"),
-    "wordpad": ("wordpad", "wordpad"),
+    "terminal": ("wt", "powershell"),
+    "windows terminal": ("wt", "powershell"),
+    "snippingtool": ("SnippingTool", "snipping"),
+    "snipping tool": ("SnippingTool", "snipping"),
+    "stickynotes": ("explorer shell:AppsFolder\\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe!App", "sticky"),
+    "sticky notes": ("explorer shell:AppsFolder\\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe!App", "sticky"),
 }
 
 
@@ -214,6 +220,14 @@ def _resolve_executable(name: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def _get_pid(window: Any) -> int | None:
+    """Safely extract process ID from a pywinauto window wrapper."""
+    pid = getattr(window, "process_id", None)
+    if callable(pid):
+        pid = pid()
+    return pid
+
+
 def start_application(
     executable: str,
     backend: str = "uia",
@@ -223,6 +237,9 @@ def start_application(
     Windows 11 modern apps (like Notepad) use a launcher process,
     so app.start() may capture the wrong PID. We start the process
     externally, detect the new window, and connect to it.
+
+    Handles Win11 Notepad tab restoration by detecting existing windows
+    before launch and connecting to genuinely new processes.
 
     Args:
         executable: Path or name of the executable to start.
@@ -238,15 +255,15 @@ def start_application(
     app_base = title_keyword
 
     try:
-        # Record existing windows matching this app BEFORE starting
+        # Record ALL existing window handles and PIDs BEFORE starting
         desktop_before = Desktop(backend=backend)
+        existing_handles = set()
         existing_pids = set()
         for w in desktop_before.windows():
             try:
+                existing_handles.add(w.handle)
                 if app_base in w.window_text().lower():
-                    pid = getattr(w, "process_id", None)
-                    if callable(pid):
-                        pid = pid()
+                    pid = _get_pid(w)
                     if pid:
                         existing_pids.add(pid)
             except Exception:
@@ -254,53 +271,42 @@ def start_application(
 
         # Start the process
         subprocess.Popen(exe_path)
-        time.sleep(3)
 
-        # Find the NEW window (PID not in existing set)
-        desktop_after = Desktop(backend=backend)
-        new_window = None
-        for w in desktop_after.windows():
-            try:
-                if app_base in w.window_text().lower():
-                    pid = getattr(w, "process_id", None)
-                    if callable(pid):
-                        pid = pid()
-                    if pid and pid not in existing_pids:
-                        new_window = w
-                        app = Application(backend=backend)
-                        app.connect(process=pid, timeout=15)
-                        return app, f"Started '{executable}' successfully"
-            except Exception:
-                continue
+        # Wait with polling — check every 0.5s for up to 8s
+        new_app = None
+        for _ in range(16):
+            time.sleep(0.5)
+            desktop_after = Desktop(backend=backend)
+            for w in desktop_after.windows():
+                try:
+                    if app_base in w.window_text().lower():
+                        pid = _get_pid(w)
+                        handle = w.handle
+                        # Prefer windows that are genuinely NEW (new handle)
+                        if handle not in existing_handles and pid:
+                            app = Application(backend=backend)
+                            app.connect(process=pid, timeout=15)
+                            return app, f"Started '{executable}' successfully"
+                        # Also accept new PID even if handle existed (Win11 reuse)
+                        if pid and pid not in existing_pids:
+                            app = Application(backend=backend)
+                            app.connect(process=pid, timeout=15)
+                            return app, f"Started '{executable}' successfully"
+                except Exception:
+                    continue
 
-        # Fallback: look for a window that looks like a fresh/new instance
-        # (e.g. "Untitled - Notepad" vs an already-open document)
-        for w in desktop_after.windows():
-            try:
-                title = w.window_text()
-                if app_base in title.lower() and "untitled" in title.lower():
-                    pid = getattr(w, "process_id", None)
-                    if callable(pid):
-                        pid = pid()
-                    if pid:
-                        app = Application(backend=backend)
-                        app.connect(process=pid, timeout=15)
-                        return app, f"Started '{executable}' successfully"
-            except Exception:
-                continue
-
-        # Last resort: connect to the first matching window
-        for w in desktop_after.windows():
+        # Fallback: if no NEW window found (Win11 apps reuse process),
+        # connect to the first matching window we can find
+        desktop_final = Desktop(backend=backend)
+        for w in desktop_final.windows():
             try:
                 title = w.window_text()
                 if app_base in title.lower():
-                    pid = getattr(w, "process_id", None)
-                    if callable(pid):
-                        pid = pid()
+                    pid = _get_pid(w)
                     if pid:
                         app = Application(backend=backend)
                         app.connect(process=pid, timeout=15)
-                        return app, f"Started '{executable}' successfully"
+                        return app, f"Started '{executable}' (reused existing process)"
             except Exception:
                 continue
 

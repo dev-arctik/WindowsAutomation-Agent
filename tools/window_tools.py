@@ -20,6 +20,26 @@ from utils.gui_helpers import (
 # Shared registry to store connected app instances across tool calls
 _app_registry: dict[str, dict[str, Any]] = {}
 
+# Aliases so "calc" and "calculator" both resolve to the same entry
+_APP_ALIASES: dict[str, list[str]] = {
+    "calc": ["calculator"],
+    "calculator": ["calc"],
+    "notepad": [],
+    "chrome": ["google chrome"],
+    "google chrome": ["chrome"],
+    "edge": ["microsoft edge"],
+    "microsoft edge": ["edge"],
+    "code": ["vscode", "vs code"],
+    "vscode": ["code", "vs code"],
+}
+
+
+def _register_app(key: str, entry: dict[str, Any]) -> None:
+    """Register an app under its key and all known aliases."""
+    _app_registry[key] = entry
+    for alias in _APP_ALIASES.get(key, []):
+        _app_registry[alias] = entry
+
 
 def get_app_registry() -> dict[str, dict[str, Any]]:
     """Get the shared app registry for cross-module access."""
@@ -97,7 +117,7 @@ def connect_to_app(app_name: str, start_if_not_found: bool = True) -> str:
     if app is not None:
         try:
             window = app.top_window()
-            _app_registry[key] = {"app": app, "window": window}
+            _register_app(key, {"app": app, "window": window})
             return f"Connected to '{app_name}'. Window: '{window.window_text()}'"
         except Exception:
             pass
@@ -108,7 +128,7 @@ def connect_to_app(app_name: str, start_if_not_found: bool = True) -> str:
         if app is not None:
             try:
                 window = app.top_window()
-                _app_registry[key] = {"app": app, "window": window}
+                _register_app(key, {"app": app, "window": window})
                 return f"Started and connected to '{app_name}'. Window: '{window.window_text()}'"
             except Exception as e:
                 return f"Started '{app_name}' but could not get window: {e}"
@@ -130,6 +150,8 @@ def start_app(app_name: str) -> str:
 
     # Remove any old registry entry so we get a fresh connection
     _app_registry.pop(key, None)
+    for alias in _APP_ALIASES.get(key, []):
+        _app_registry.pop(alias, None)
 
     app, msg = start_application(app_name)
     if app is None:
@@ -137,7 +159,7 @@ def start_app(app_name: str) -> str:
 
     try:
         window = app.top_window()
-        _app_registry[key] = {"app": app, "window": window}
+        _register_app(key, {"app": app, "window": window})
         return f"Started '{app_name}'. Window: '{window.window_text()}'"
     except Exception as e:
         return f"Started '{app_name}' but could not get window: {e}"
