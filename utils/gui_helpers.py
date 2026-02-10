@@ -177,15 +177,69 @@ else:
 
 
 # ---------------------------------------------------------------------------
+# App name → executable mapping for common Windows apps
+# ---------------------------------------------------------------------------
+
+APP_EXECUTABLES: dict[str, tuple[str, str]] = {
+    # name → (executable_path, window_title_keyword)
+    "chrome": (r"C:\Program Files\Google\Chrome\Application\chrome.exe", "chrome"),
+    "google chrome": (r"C:\Program Files\Google\Chrome\Application\chrome.exe", "chrome"),
+    "firefox": (r"C:\Program Files\Mozilla Firefox\firefox.exe", "firefox"),
+    "brave": (r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe", "brave"),
+    "edge": (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", "edge"),
+    "microsoft edge": (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", "edge"),
+    "notepad": ("notepad", "notepad"),
+    "calculator": ("calc", "calculator"),
+    "calc": ("calc", "calculator"),
+    "explorer": ("explorer", "explorer"),
+    "file explorer": ("explorer", "explorer"),
+    "cmd": ("cmd", "command prompt"),
+    "powershell": ("powershell", "powershell"),
+    "terminal": ("wt", "powershell"),
+    "windows terminal": ("wt", "powershell"),
+    "snippingtool": ("SnippingTool", "snipping"),
+    "snipping tool": ("SnippingTool", "snipping"),
+    "stickynotes": ("explorer shell:AppsFolder\\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe!App", "sticky"),
+    "sticky notes": ("explorer shell:AppsFolder\\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe!App", "sticky"),
+}
+
+
+def _resolve_executable(name: str) -> tuple[str, str]:
+    """Resolve a friendly app name to (executable_path, window_title_keyword).
+
+    Returns the original name as both if no mapping exists.
+    """
+    key = name.lower().replace(".exe", "").strip()
+    if key in APP_EXECUTABLES:
+        return APP_EXECUTABLES[key]
+    return (name, key)
+
+
+# ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
+
+
+def _get_pid(window: Any) -> int | None:
+    """Safely extract process ID from a pywinauto window wrapper."""
+    pid = getattr(window, "process_id", None)
+    if callable(pid):
+        pid = pid()
+    return pid
 
 
 def start_application(
     executable: str,
     backend: str = "uia",
 ) -> tuple[Any | None, str]:
-    """Start an application by executable path.
+    """Start an application and connect to its new window.
+
+    Windows 11 modern apps (like Notepad) use a launcher process,
+    so app.start() may capture the wrong PID. We start the process
+    externally, detect the new window, and connect to it.
+
+    Handles Win11 Notepad tab restoration by detecting existing windows
+    before launch and connecting to genuinely new processes.
 
     Args:
         executable: Path or name of the executable to start.
@@ -194,10 +248,69 @@ def start_application(
     Returns:
         Tuple of (Application instance or None, status message).
     """
+    import subprocess
+    import time
+
+    exe_path, title_keyword = _resolve_executable(executable)
+    app_base = title_keyword
+
     try:
-        app = Application(backend=backend)
-        app.start(executable, timeout=10)
-        return app, f"Started '{executable}' successfully"
+        # Record ALL existing window handles and PIDs BEFORE starting
+        desktop_before = Desktop(backend=backend)
+        existing_handles = set()
+        existing_pids = set()
+        for w in desktop_before.windows():
+            try:
+                existing_handles.add(w.handle)
+                if app_base in w.window_text().lower():
+                    pid = _get_pid(w)
+                    if pid:
+                        existing_pids.add(pid)
+            except Exception:
+                continue
+
+        # Start the process
+        subprocess.Popen(exe_path)
+
+        # Wait with polling — check every 0.5s for up to 8s
+        new_app = None
+        for _ in range(16):
+            time.sleep(0.5)
+            desktop_after = Desktop(backend=backend)
+            for w in desktop_after.windows():
+                try:
+                    if app_base in w.window_text().lower():
+                        pid = _get_pid(w)
+                        handle = w.handle
+                        # Prefer windows that are genuinely NEW (new handle)
+                        if handle not in existing_handles and pid:
+                            app = Application(backend=backend)
+                            app.connect(process=pid, timeout=15)
+                            return app, f"Started '{executable}' successfully"
+                        # Also accept new PID even if handle existed (Win11 reuse)
+                        if pid and pid not in existing_pids:
+                            app = Application(backend=backend)
+                            app.connect(process=pid, timeout=15)
+                            return app, f"Started '{executable}' successfully"
+                except Exception:
+                    continue
+
+        # Fallback: if no NEW window found (Win11 apps reuse process),
+        # connect to the first matching window we can find
+        desktop_final = Desktop(backend=backend)
+        for w in desktop_final.windows():
+            try:
+                title = w.window_text()
+                if app_base in title.lower():
+                    pid = _get_pid(w)
+                    if pid:
+                        app = Application(backend=backend)
+                        app.connect(process=pid, timeout=15)
+                        return app, f"Started '{executable}' (reused existing process)"
+            except Exception:
+                continue
+
+        return None, f"Started '{executable}' but could not find its window"
     except Exception as e:
         return None, f"Failed to start '{executable}': {e}"
 
@@ -317,9 +430,12 @@ def list_all_windows(backend: str = "uia") -> list[dict[str, Any]]:
         result = []
         for w in windows:
             try:
+                pid = getattr(w, "process_id", None)
+                if callable(pid):
+                    pid = pid()
                 result.append({
                     "title": w.window_text(),
-                    "process_id": getattr(w, "process_id", None),
+                    "process_id": pid,
                     "rectangle": str(w.rectangle()),
                     "class_name": w.friendly_class_name(),
                 })
@@ -342,6 +458,8 @@ def safe_click(control: Any, timeout: int = 10) -> str:
     """
     try:
         control.wait("enabled", timeout=timeout)
+        if hasattr(control, "set_focus"):
+            control.set_focus()
         control.click_input()
         return f"Clicked '{control.window_text()}'"
     except Exception as e:
@@ -359,9 +477,15 @@ def safe_type(control: Any, text: str, timeout: int = 10) -> str:
     Returns:
         Status message.
     """
+    import time as _time
+
     try:
         control.wait("enabled", timeout=timeout)
-        control.type_keys(text, with_spaces=True)
+        if hasattr(control, "set_focus"):
+            control.set_focus()
+        # Small pause before typing to let focus settle
+        _time.sleep(0.3)
+        control.type_keys(text, with_spaces=True, pause=0.05)
         return f"Typed text into '{control.window_text()}'"
     except Exception as e:
         return f"Type failed: {e}"

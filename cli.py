@@ -21,6 +21,11 @@ app = typer.Typer(
 console = Console()
 
 
+def _safe(text: str) -> str:
+    """Strip characters that can't be encoded in the Windows console (cp1252)."""
+    return text.encode("cp1252", errors="replace").decode("cp1252")
+
+
 @app.command()
 def run(
     command: str = typer.Argument(help="Natural language automation command"),
@@ -53,6 +58,8 @@ def run(
             "status": "starting",
             "iteration_count": 0,
             "next_node": "",
+            "retry_count": 0,
+            "step_failed": False,
         },
         config,
     )
@@ -68,7 +75,10 @@ def run(
 
     # Execution steps table
     planned = result.get("planned_actions", [])
+    exec_results = result.get("execution_results", [])
     if planned:
+        from graphs.automation_graph import _result_has_error
+
         table = Table(title="Execution Steps", show_lines=True)
         table.add_column("#", style="cyan", width=4)
         table.add_column("Action", style="white")
@@ -78,10 +88,10 @@ def run(
         current = result.get("current_step", 0)
         for step in planned:
             step_num = step["step_number"]
-            step_status = (
-                "[green]Done[/green]" if step_num <= current
-                else "[yellow]Pending[/yellow]"
-            )
+            if step_num <= current:
+                step_status = "[green]Done[/green]"
+            else:
+                step_status = "[yellow]Pending[/yellow]"
             table.add_row(
                 str(step_num),
                 step["action"],
@@ -90,12 +100,20 @@ def run(
             )
         console.print(table)
 
+        # Show error summary if any
+        error_count = sum(1 for r in exec_results if _result_has_error(r))
+        if error_count > 0:
+            console.print(
+                f"\n[bold yellow]Warning: {error_count} tool call(s) had errors "
+                f"(retried or skipped)[/bold yellow]"
+            )
+
     # Execution results
     results = result.get("execution_results", [])
     if results:
         console.print("\n[bold]Execution Log:[/bold]")
         for i, r in enumerate(results, 1):
-            console.print(f"  {i}. {r}")
+            console.print(f"  {i}. {_safe(r)}")
 
     # Verbose message output
     if verbose:
@@ -103,7 +121,7 @@ def run(
         for msg in result.get("messages", []):
             if hasattr(msg, "content") and msg.content:
                 role = getattr(msg, "type", "unknown")
-                console.print(f"  [{role}] {msg.content[:200]}")
+                console.print(f"  [{role}] {_safe(msg.content[:200])}")
 
 
 @app.command()

@@ -69,3 +69,49 @@ poetry run python 001-basic_notepad.py
 - pywinauto only works on Windows. For development on macOS, you can build/test the graph logic and mock the pywinauto calls
 - Two pywinauto backends: `win32` (default, lighter) and `uia` (richer control access) — prefer `uia` for modern apps
 - Always use pywinauto's built-in waits instead of `time.sleep()`
+
+## Development Tools
+
+### pywinauto-mcp (Debugging Only)
+MCP server for interactive Windows GUI automation. **Only use for debugging and verification, NOT for runtime automation.**
+
+- **Location**: `D:\project_KLUTZ\pywinauto-mcp`
+- **Agent**: `.claude/agents/mcp-helper.md`
+- **Docs**: `MCP_SETUP.md`
+
+**When to use pywinauto-mcp:**
+- Verifying CLI automation results (did Notepad actually get the text? Did Calculator show the right answer?)
+- Inspecting control trees to find correct auto_ids and control names
+- Debugging failures (take screenshots, list windows, check element states)
+- Testing new pywinauto patterns before adding them to tools/
+
+**When NOT to use pywinauto-mcp:**
+- DO NOT use it as the primary automation — `cli.py` is the product, MCP is the debugger
+- DO NOT replace CLI testing with direct MCP automation
+
+**Debugging workflow:**
+1. Run `cli.py run "your command"` via Bash
+2. Use `automation_windows("list")` to verify the app launched
+3. Use `automation_elements("list", ...)` or `automation_visual("screenshot")` to verify results
+4. Use `automation_windows("manage", handle=..., action="restore")` to bring windows to foreground before screenshots
+5. If something failed, use `automation_elements("list", ..., max_depth=5)` to find correct control identifiers
+
+**Important MCP quirks:**
+- Always bring windows to foreground with `manage→restore` before interacting
+- Use `automation_visual("screenshot")` for desktop-level screenshots (window-level can fail)
+- All MCP tool permissions should be in `.claude/settings.local.json` to avoid focus-stealing approval dialogs
+
+## Known Windows 11 Quirks
+- **Notepad restores tabs**: Win11 Notepad restores previous session tabs on launch. The planner always adds `Ctrl+N` after `start_app("notepad")` to open a clean new tab.
+- **Calculator auto_ids**: Use `num0Button`..`num9Button`, `plusButton`, `minusButton`, `multiplyButton`, `divideButton`, `equalButton`, `clearButton`, etc. NEVER use digit titles like "7" — use auto_ids.
+- **UWP/WinUI3 apps**: Modern Windows apps use launcher processes that don't match the final window PID. `start_application()` in `gui_helpers.py` handles this with polling and handle-based detection.
+
+## Graph Architecture Details
+The automation graph uses a **supervisor pattern** with retry logic:
+- `supervisor` → deterministic routing (no LLM) based on state
+- `intent_parser` → calls planner sub-graph for structured action plan
+- `action_executor` → LLM picks tools to execute each step (with full context)
+- `step_result_checker` → inspects tool results for error patterns, retries up to 2x per step
+- `verifier` → inspects final app state with inspect tools
+- Error patterns checked: "not connected", "Control not found", "timed out", "failed:", etc.
+- Max 30 iterations before forced stop
